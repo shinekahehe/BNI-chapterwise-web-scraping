@@ -39,6 +39,26 @@ def normalize_url(raw: str) -> str:
     return urldefrag(raw.strip())[0]
 
 
+def normalize_phone(phone_str: Optional[str]) -> Optional[str]:
+    """
+    Normalizes phone numbers to 10-digit format (removes country codes, spaces, dashes, etc.)
+    Returns None if the phone doesn't look valid.
+    """
+    if not phone_str:
+        return None
+    # Remove common separators and country codes
+    cleaned = re.sub(r"[\s\+\-\(\)\.]", "", str(phone_str))
+    # Remove leading country codes (91, 0091, +91, etc.)
+    if cleaned.startswith("0091") and len(cleaned) == 13:
+        cleaned = cleaned[4:]
+    elif cleaned.startswith("91") and len(cleaned) == 12:
+        cleaned = cleaned[2:]
+    # Extract 10-digit phone starting with 6-9 (Indian mobile)
+    if len(cleaned) >= 10 and cleaned[0] in "6789":
+        return cleaned[-10:] if len(cleaned) > 10 else cleaned
+    return None
+
+
 async def _block_heavy_resources(route) -> None:
     try:
         rtype = route.request.resource_type
@@ -50,12 +70,14 @@ async def _block_heavy_resources(route) -> None:
     await route.continue_()
 
 
-async def extract_profile_links_from_memberlist(page) -> List[Tuple[str, str, str, str]]:
+async def extract_profile_links_from_memberlist(
+    page,
+) -> List[Tuple[str, str, str, Optional[str], str]]:
     """
     Returns list of tuples:
-    (name, business, category, profile_url)
+    (name, business, category, phone, profile_url)
     """
-    results: List[Tuple[str, str, str, str]] = []
+    results: List[Tuple[str, str, str, Optional[str], str]] = []
 
     await page.wait_for_selector("table.listtables tbody tr", timeout=60_000)
 
@@ -76,12 +98,82 @@ async def extract_profile_links_from_memberlist(page) -> List[Tuple[str, str, st
             business = (await cells[1].inner_text()).strip()
             category = (await cells[2].inner_text()).strip()
 
+            # Phone can be present in a hidden column (e.g. <td style="display:none"><bdi>...</bdi></td>)
+            # Search ALL cells for phone patterns (not just cells[3], as column order may vary)
+            phone: Optional[str] = None
+            try:
+                # First, try to find a <bdi> tag in any cell (common pattern for hidden phone)
+                # Use inner_html to get text even from hidden elements
+                for cell in cells:
+                    bdi = await cell.query_selector("bdi")
+                    if bdi:
+                        phone_txt = (await bdi.inner_text()).strip()
+                        if phone_txt:
+                            phone = normalize_phone(phone_txt)
+                            if phone:
+                                break
+                
+                # If no <bdi> found via inner_text, try getting raw HTML to catch hidden elements
+                if not phone:
+                    for cell in cells:
+                        cell_html = await cell.inner_html()
+                        # Look for <bdi> in raw HTML (works even if display:none)
+                        bdi_match = re.search(r'<bdi[^>]*>([^<]+)</bdi>', cell_html, re.IGNORECASE)
+                        if bdi_match:
+                            phone_txt = bdi_match.group(1).strip()
+                            if phone_txt:
+                                phone = normalize_phone(phone_txt)
+                                if phone:
+                                    break
+                
+                # If still no phone, search all cell text for phone patterns
+                if not phone:
+                    for cell in cells:
+                        cell_text = (await cell.inner_text()).strip()
+                        if not cell_text:
+                            continue
+                        # Match Indian phone patterns: +91, spaces, dashes, 10 digits starting with 6-9
+                        # Try multiple patterns to catch various formats
+                        patterns = [
+                            r"(?:\+?91[-\s]?)?([6-9]\d{9})",  # Standard format
+                            r"([6-9]\d{9})",  # Just 10 digits
+                        ]
+                        for pattern in patterns:
+                            m = re.search(pattern, cell_text)
+                            if m:
+                                candidate = normalize_phone(m.group(1))
+                                if candidate:
+                                    phone = candidate
+                                    break
+                        if phone:
+                            break
+                
+                # Last resort: search raw HTML for phone patterns
+                if not phone:
+                    for cell in cells:
+                        cell_html = await cell.inner_html()
+                        patterns = [
+                            r"(?:\+?91[-\s]?)?([6-9]\d{9})",  # Standard format
+                            r"([6-9]\d{9})",  # Just 10 digits
+                        ]
+                        for pattern in patterns:
+                            m = re.search(pattern, cell_html)
+                            if m:
+                                candidate = normalize_phone(m.group(1))
+                                if candidate:
+                                    phone = candidate
+                                    break
+                        if phone:
+                            break
+            except Exception:
+                phone = None
+
             href = await name_link.get_attribute("href")
             if not href:
                 continue
 
             profile_url = urljoin(page.url, href)
-            results.append((name, business, category, profile_url))
+            results.append((name, business, category, phone, profile_url))
 
         next_button = await page.query_selector('a[title="Next"]')
         if not next_button:
@@ -95,14 +187,16 @@ async def extract_profile_links_from_memberlist(page) -> List[Tuple[str, str, st
         await page.wait_for_timeout(400)
 
     # De-dupe by profile_url (some pages can repeat due to weird nav)
-    deduped: Dict[str, Tuple[str, str, str, str]] = {}
+    deduped: Dict[str, Tuple[str, str, str, Optional[str], str]] = {}
     for t in results:
-        deduped[t[3]] = t
+        deduped[t[4]] = t
     return list(deduped.values())
 
 
-async def scrape_profile(context, base: Tuple[str, str, str, str]) -> Dict[str, Any]:
-    name, business, category, profile_url = base
+async def scrape_profile(
+    context, base: Tuple[str, str, str, Optional[str], str]
+) -> Dict[str, Any]:
+    name, business, category, phone_from_list, profile_url = base
 
     page = await context.new_page()
     try:
@@ -122,7 +216,7 @@ async def scrape_profile(context, base: Tuple[str, str, str, str]) -> Dict[str, 
                 "name": name,
                 "business": business,
                 "category": category,
-                "phone": None,
+                "phone": phone_from_list or None,
                 "top_product": None,
                 "ideal_referral": None,
                 "top_problem_solved": None,
@@ -138,15 +232,15 @@ async def scrape_profile(context, base: Tuple[str, str, str, str]) -> Dict[str, 
         # - Sometimes as a simple <a href="tel:...">
         # - Sometimes inside .memberContactDetails, where the visible text is the phone number
         # - Sometimes only as plain text (no tel: link)
-        phone: Optional[str] = None
+        phone: Optional[str] = normalize_phone(phone_from_list)
         try:
             tel = await page.query_selector('a[href^="tel:"]')
             if tel:
                 href = await tel.get_attribute("href")
                 if href and href.startswith("tel:"):
-                    phone = href.replace("tel:", "").strip() or None
+                    phone = normalize_phone(href.replace("tel:", "").strip()) or phone
         except Exception:
-            phone = None
+            pass
 
         # Fallback 1: `.memberContactDetails a[href^='tel:']` (chapterdetails.py style)
         if not phone:
@@ -155,11 +249,11 @@ async def scrape_profile(context, base: Tuple[str, str, str, str]) -> Dict[str, 
                 if tel2:
                     txt = (await tel2.inner_text()).strip()
                     if txt:
-                        phone = txt
-                    else:
+                        phone = normalize_phone(txt)
+                    if not phone:
                         href2 = await tel2.get_attribute("href")
                         if href2 and href2.startswith("tel:"):
-                            phone = href2.replace("tel:", "").strip() or None
+                            phone = normalize_phone(href2.replace("tel:", "").strip())
             except Exception:
                 pass
 
@@ -170,9 +264,9 @@ async def scrape_profile(context, base: Tuple[str, str, str, str]) -> Dict[str, 
                 if contact:
                     blob = (await contact.inner_text()).strip()
                     # Match common India formats (+91, spaces, dashes)
-                    m = re.search(r"(?:\\+?91[-\\s]?)?([6-9]\\d{9})", blob)
+                    m = re.search(r"(?:\+?91[-\s]?)?([6-9]\d{9})", blob)
                     if m:
-                        phone = m.group(1)
+                        phone = normalize_phone(m.group(1))
             except Exception:
                 pass
 
@@ -364,18 +458,17 @@ async def scrape_chapter(chapter: Chapter, *, out_dir: str, profile_concurrency:
 
         sem = asyncio.Semaphore(profile_concurrency)
 
-        async def worker(b: Tuple[str, str, str, str]) -> Dict[str, Any]:
+        async def worker(b: Tuple[str, str, str, Optional[str], str]) -> Dict[str, Any]:
             async with sem:
                 try:
                     data = await scrape_profile(context, b)
                 except Exception as e:
-                    name, business, category, profile_url = b
+                    name, business, category, phone_from_list, profile_url = b
                     data = {
                         "name": name,
                         "business": business,
                         "category": category,
-                        "phone": None,
-                        "my_business": None,
+                        "phone": phone_from_list or None,
                         "top_product": None,
                         "ideal_referral": None,
                         "top_problem_solved": None,
